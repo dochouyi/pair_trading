@@ -1,3 +1,4 @@
 statsmodels
 scikit-learn
 deap
+ta
