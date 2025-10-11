@@ -12,10 +12,7 @@ from freqtrade.strategy import IStrategy
 from pandas import DataFrame
 from ta.volatility import BollingerBands
 
-# 可选：ADF等筛选若需要再加（statsmodels较重，在线计算注意频率）
-# from statsmodels.tsa.stattools import adfuller
-
-# ============= 配置数据类（与回测代码思想一致，精简版） =============
+# ============= 配置数据类（集中配置） =============
 @dataclass
 class SignalConfig:
     timeframe: str = "5m"
@@ -26,18 +23,26 @@ class SignalConfig:
     recompute_every: int = 20
     min_corr: float = 0.2
     use_log_price: bool = False
-    # 交易逻辑信号（仅生成信号，不下单）
+
+    # 信号参数
     z_stop: float = 6.0
     z_exit_to_sma: bool = True
     takeprofit_exit_buffer_z: float = 0.2
     enforce_profit_on_cross: bool = True
     min_take_profit_pct: float = 0.2
+
     select_pairs_per_window: int = 1
     max_candidates_per_method: int = 20
+
+    # 冷却与去抖
+    cooldown_bars_open: int = 10
+    cooldown_bars_close: int = 3
+
     # Redis
     redis_url: str = os.getenv("REDIS_URL", "redis://localhost:6379/0")
     stream_name: str = os.getenv("STREAM_NAME", "ft_pair_signals")
     bot_id: str = os.getenv("BOT_ID", "signal-bot-1")
+
 
 # ============= Redis 轻量封装 =============
 class RedisClient:
@@ -47,10 +52,14 @@ class RedisClient:
         self.stream = stream
 
     def publish(self, payload: dict) -> str:
-        # 使用Redis Stream，字段为扁平字符串
-        fields = {k: json.dumps(v, ensure_ascii=False) for k, v in payload.items()}
-        msgid = self.r.xadd(self.stream, fields, maxlen=50000, approximate=True)
-        return msgid
+        try:
+            fields = {k: json.dumps(v, ensure_ascii=False) for k, v in payload.items()}
+            msgid = self.r.xadd(self.stream, fields, maxlen=50000, approximate=True)
+            return msgid
+        except Exception as e:
+            # 将异常上抛，由调用方记录日志
+            raise e
+
 
 # ============= 工具函数（配对、距离、beta等） =============
 def estimate_beta_on_window(a: pd.Series, b: pd.Series, use_log_price=True, min_len: int = 30) -> float:
@@ -60,13 +69,14 @@ def estimate_beta_on_window(a: pd.Series, b: pd.Series, use_log_price=True, min_
     a = a.loc[idx]; b = b.loc[idx]
     if len(a) < min_len:
         return 1.0
-    # 简化：用OLS的近似斜率 = cov / var
+    # 简化 OLS 斜率 ≈ cov / var
     cov = np.cov(b.values, a.values)[0, 1]
     var = np.var(b.values)
     beta = cov / var if var > 0 else 1.0
     if not np.isfinite(beta):
         beta = 1.0
     return float(np.clip(beta, 0.1, 10.0))
+
 
 def unified_scaled_distance(a: pd.Series, b: pd.Series) -> float:
     idx = a.dropna().index.intersection(b.dropna().index)
@@ -80,6 +90,7 @@ def unified_scaled_distance(a: pd.Series, b: pd.Series) -> float:
     As = (A - mu) / sd
     Bs = (B - mu) / sd
     return float(np.linalg.norm(As.flatten() - Bs.flatten()))
+
 
 def euclidean_distance_method(prices: Dict[str, pd.Series], cfg: SignalConfig, topk: int) -> List[Tuple[str, str, float]]:
     scores = []
@@ -98,6 +109,7 @@ def euclidean_distance_method(prices: Dict[str, pd.Series], cfg: SignalConfig, t
         pairs.append((a, b, beta))
     return pairs
 
+
 def compute_bb(spread: pd.Series, window: int, k: float):
     bb = BollingerBands(close=spread, window=window, window_dev=k, fillna=False)
     sma = bb.bollinger_mavg()
@@ -105,6 +117,7 @@ def compute_bb(spread: pd.Series, window: int, k: float):
     lower = bb.bollinger_lband()
     sd = ((upper - sma) / k).clip(lower=1e-6)
     return sma, upper, lower, sd
+
 
 # ============= 策略类（不下单，只发布信号） =============
 class PairSignalStrategy(IStrategy):
@@ -132,7 +145,9 @@ class PairSignalStrategy(IStrategy):
     _current_pairs: List[Tuple[str, str, float]] = []  # [(A,B,beta)]
     _main_leg_map: Dict[str, Dict] = {}               # A-> {mate, beta}, B-> {mate, beta_adj}
     _lock = threading.Lock()
-    _bot_started: bool = False
+
+    # 冷却控制：记录每个组最后一次动作所在bar索引
+    _pair_last_action_bar: Dict[str, int] = {}
 
     def informative_pairs(self):
         # 允许白名单中的所有对，确保可跨pair取数据
@@ -148,10 +163,16 @@ class PairSignalStrategy(IStrategy):
         if self._redis is None:
             self._redis = RedisClient(self.cfg.redis_url, self.cfg.stream_name)
 
+    @staticmethod
+    def _pair_key(a: str, b: str) -> str:
+        return "|".join(sorted([a, b]))
+
     def _recompute_candidates(self, df_map: Dict[str, DataFrame]) -> List[Tuple[str, str, float]]:
         # 取最近 form_period 的close
         closes: Dict[str, pd.Series] = {}
         for pair, df in df_map.items():
+            if "close" not in df.columns:
+                continue
             s = df["close"].dropna()
             if s.shape[0] >= self.cfg.min_form_bars:
                 closes[pair] = s.iloc[-self.cfg.form_period:]
@@ -160,9 +181,12 @@ class PairSignalStrategy(IStrategy):
 
         base_pairs = euclidean_distance_method(closes, self.cfg, topk=self.cfg.max_candidates_per_method)
 
-        # 二次过滤：相关性与样本量
+        # 互斥选择 + 二次过滤：相关性与样本量
+        used = set()
         filtered: List[Tuple[str, str, float]] = []
         for a, b, beta in base_pairs:
+            if a in used or b in used:
+                continue
             sA = closes[a].pct_change().dropna()
             sB = closes[b].pct_change().dropna()
             idx = sA.index.intersection(sB.index)
@@ -172,6 +196,7 @@ class PairSignalStrategy(IStrategy):
             if (corr is None) or (not np.isfinite(corr)) or (corr < self.cfg.min_corr):
                 continue
             filtered.append((a, b, beta))
+            used.add(a); used.add(b)
             if len(filtered) >= self.cfg.select_pairs_per_window:
                 break
         return filtered
@@ -191,6 +216,7 @@ class PairSignalStrategy(IStrategy):
         stake由执行机器人决定，或这里给一个建议字段
         """
         self._ensure_redis()
+        group_id = self._pair_key(pair_a, pair_b)
         cmd = {
             "id": str(uuid.uuid4()),
             "version": 1,
@@ -198,7 +224,8 @@ class PairSignalStrategy(IStrategy):
             "ts": pd.Timestamp.utcnow().isoformat(),
             "action": "open",
             "reason": reason,
-            "beta": beta,
+            "beta": float(beta),
+            "group_id": group_id,
             "constraints": {
                 "must_fill_both": True,
                 "timeout_sec": 5
@@ -209,11 +236,15 @@ class PairSignalStrategy(IStrategy):
             ],
             "correlation_tag": f"{pair_a}|{pair_b}|{int(time.time())}"
         }
-        msgid = self._redis.publish(cmd)
-        self.logger.info(f"[SIGNAL] OPEN -> {cmd['correlation_tag']} sides: {side_a}/{side_b}, beta={beta:.4f}, msgid={msgid}")
+        try:
+            msgid = self._redis.publish(cmd)
+            self.logger.info(f"[SIGNAL] OPEN -> {cmd['correlation_tag']} sides: {side_a}/{side_b}, beta={beta:.4f}, msgid={msgid}")
+        except Exception as e:
+            self.logger.exception(f"[SIGNAL][ERR] OPEN publish failed {group_id}: {e}")
 
     def _publish_close(self, pair_a: str, pair_b: str, reason: str):
         self._ensure_redis()
+        group_id = self._pair_key(pair_a, pair_b)
         cmd = {
             "id": str(uuid.uuid4()),
             "version": 1,
@@ -221,6 +252,7 @@ class PairSignalStrategy(IStrategy):
             "ts": pd.Timestamp.utcnow().isoformat(),
             "action": "close",
             "reason": reason,
+            "group_id": group_id,
             "constraints": {
                 "must_fill_both": True,
                 "timeout_sec": 5
@@ -231,8 +263,19 @@ class PairSignalStrategy(IStrategy):
             ],
             "correlation_tag": f"{pair_a}|{pair_b}|{int(time.time())}"
         }
-        msgid = self._redis.publish(cmd)
-        self.logger.info(f"[SIGNAL] CLOSE -> {cmd['correlation_tag']} reason: {reason}, msgid={msgid}")
+        try:
+            msgid = self._redis.publish(cmd)
+            self.logger.info(f"[SIGNAL] CLOSE -> {cmd['correlation_tag']} reason: {reason}, msgid={msgid}")
+        except Exception as e:
+            self.logger.exception(f"[SIGNAL][ERR] CLOSE publish failed {group_id}: {e}")
+
+    def _can_open(self, key: str, cur_bar: int) -> bool:
+        last = self._pair_last_action_bar.get(key, -10**9)
+        return (cur_bar - last) >= self.cfg.cooldown_bars_open
+
+    def _can_close(self, key: str, cur_bar: int) -> bool:
+        last = self._pair_last_action_bar.get(key, -10**9)
+        return (cur_bar - last) >= self.cfg.cooldown_bars_close
 
     def populate_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         """
@@ -266,7 +309,7 @@ class PairSignalStrategy(IStrategy):
                 self._current_pairs = pairs
                 self._build_maps(pairs)
                 self._last_recompute_index = cur_len
-                self.logger.info(f"[PAIR] Recomputed candidates: {pairs}")
+                self.logger.info(f"[PAIR] Recomputed candidates ({len(pairs)}): {pairs}")
 
         # 基于当前pairs产生信号（开/平）
         # 逻辑：对每个配对(A,B,beta)，计算spread与布林；到达上/下轨发送OPEN；跨中轨或止损发送CLOSE
@@ -275,6 +318,8 @@ class PairSignalStrategy(IStrategy):
             dfb = df_map.get(b)
             if dfa is None or dfb is None:
                 continue
+            if "close" not in dfa.columns or "close" not in dfb.columns:
+                continue
             # 对齐索引
             idx = dfa.index.union(dfb.index).sort_values()
             A = dfa["close"].reindex(idx).ffill().bfill()
@@ -282,9 +327,14 @@ class PairSignalStrategy(IStrategy):
             if A.dropna().shape[0] < self.cfg.form_period or B.dropna().shape[0] < self.cfg.form_period:
                 continue
 
+            # 当前bar索引：用对齐后的序列长度
+            cur_bar = len(A)
+            key = self._pair_key(a, b)
+
             spread = (A - beta * B) if not self.cfg.use_log_price else (np.log(A) - beta * np.log(B))
             sma, up, lo, sd = compute_bb(spread, self.cfg.bb_window, self.cfg.bb_k)
-            if sma.isna().iloc[-1] or up.isna().iloc[-1] or lo.isna().iloc[-1] or sd.isna().iloc[-1]:
+            # 若布林尚未生成，跳过
+            if any([sma.isna().iloc[-1], up.isna().iloc[-1], lo.isna().iloc[-1], sd.isna().iloc[-1]]):
                 continue
 
             sp = spread.iloc[-1]; ma = sma.iloc[-1]; upp = up.iloc[-1]; low = lo.iloc[-1]; sdd = sd.iloc[-1]
@@ -293,37 +343,36 @@ class PairSignalStrategy(IStrategy):
             z = float((sp - ma) / sdd)
 
             # 信号判定
-            # 开仓：
-            #   sp >= upp -> shortA_longB
-            #   sp <= low -> longA_shortB
-            # 平仓：
-            #   止损 | 跨中轨(+缓冲)
             open_shortA = sp >= upp
             open_longA = sp <= low
             stop_flag = abs(z) >= self.cfg.z_stop
 
-            cross_ok_long = (sp >= ma)  # 针对 longA_shortB 的平仓条件
-            cross_ok_short = (sp <= ma) # 针对 shortA_longB 的平仓条件
+            # 中轨平仓条件（带缓冲z）
+            cross_ok_long = (sp >= ma)
+            cross_ok_short = (sp <= ma)
             if self.cfg.takeprofit_exit_buffer_z > 0:
                 cross_ok_long = cross_ok_long and (abs(z) <= self.cfg.takeprofit_exit_buffer_z)
                 cross_ok_short = cross_ok_short and (abs(z) <= self.cfg.takeprofit_exit_buffer_z)
 
-            # 这里不跟踪真正持仓状态（由执行机器人管理）。为避免重复指令：
-            # 简化策略：仅在触发边界时发布OPEN；在跨中轨或止损时发布CLOSE。
-            # 生产环境建议：引入去抖与cooldown，以及从Redis获取已开组信息避免重复。
+            # 执行（带冷却去抖）
             try:
-                if open_shortA:
+                if open_shortA and self._can_open(key, cur_bar):
                     # shortA_longB
                     self._publish_open(a, b, side_a="short", side_b="long", beta=beta, reason="spread>=upper")
-                elif open_longA:
+                    self._pair_last_action_bar[key] = cur_bar
+                elif open_longA and self._can_open(key, cur_bar):
                     # longA_shortB
                     self._publish_open(a, b, side_a="long", side_b="short", beta=beta, reason="spread<=lower")
+                    self._pair_last_action_bar[key] = cur_bar
 
-                if stop_flag:
+                # 平仓
+                if stop_flag and self._can_close(key, cur_bar):
                     self._publish_close(a, b, reason=f"abs(z)>={self.cfg.z_stop}")
+                    self._pair_last_action_bar[key] = cur_bar
                 elif self.cfg.z_exit_to_sma:
-                    if cross_ok_long or cross_ok_short:
+                    if (cross_ok_long or cross_ok_short) and self._can_close(key, cur_bar):
                         self._publish_close(a, b, reason="cross_sma_with_buffer")
+                        self._pair_last_action_bar[key] = cur_bar
             except Exception as e:
                 self.logger.exception(f"Publish signal error for {a}-{b}: {e}")
 

@@ -133,13 +133,12 @@ def load_freqtrade_dir(dir_path: str, max_symbols: int = None) -> Dict[str, pd.D
         raise FileNotFoundError("No -5m-futures.json found.")
     return data
 
-def estimate_beta_on_window(a_series: pd.Series, b_series: pd.Series, use_log_price=True, min_len:int=30) -> float:
-    a = np.log(a_series.dropna()) if use_log_price else a_series.dropna().copy()
-    b = np.log(b_series.dropna()) if use_log_price else b_series.dropna().copy()
+def estimate_beta_on_window(a_series: pd.Series, b_series: pd.Series, use_log_price=True) -> float:
+    a = np.log(a_series) if use_log_price else a_series.dropna().copy()
+    b = np.log(b_series) if use_log_price else b_series.dropna().copy()
     idx = a.index.intersection(b.index)
     a = a.loc[idx]; b = b.loc[idx]
-    if len(a) < min_len:
-        return 1.0
+
     X = sm.add_constant(b.values)
     try:
         model = sm.OLS(a.values, X).fit()
@@ -215,6 +214,8 @@ def sdr_method(prices: Dict[str, pd.Series], market: pd.Series, cfg: Config, top
         beta=estimate_beta_on_window(prices[a], prices[b], use_log_price=cfg.use_log_price, min_len=max(30, cfg.bb_window))
         pairs.append((a,b,beta))
     return pairs
+
+
 
 def make_candidate_pairs(form_prices: Dict[str, pd.Series],
                          method: str,
