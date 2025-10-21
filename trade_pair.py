@@ -211,7 +211,7 @@ def sdr_method(prices: Dict[str, pd.Series], market: pd.Series, cfg: Config, top
     results.sort(key=lambda x:x[2])
     pairs=[]
     for a,b,_ in results[:topk]:
-        beta=estimate_beta_on_window(prices[a], prices[b], use_log_price=cfg.use_log_price, min_len=max(30, cfg.bb_window))
+        beta=estimate_beta_on_window(prices[a], prices[b], use_log_price=cfg.use_log_price)
         pairs.append((a,b,beta))
     return pairs
 
@@ -485,25 +485,14 @@ def backtest_single_position_flow(data: Dict[str, pd.DataFrame], cfg: Config) ->
     assert cfg.method in ["Distance","SDR"]
     symbols=list(data.keys())
     closes={s: data[s]["close"].copy() for s in symbols}
-    all_index=None
-    for s in symbols:
-        idx=closes[s].index
-        all_index=idx if all_index is None else all_index.union(idx)
-    all_index=all_index.sort_values()
 
-    close_aligned = {s: closes[s].reindex(all_index).ffill().bfill() for s in symbols}
+    all_index=closes[symbols[0]].index
 
     if cfg.sdr_use_btc_as_market:
         btc_key=next((k for k in symbols if k.upper().startswith("BTC")), None)
-        if btc_key is None and cfg.debug:
-            print("[WARN] BTC not found in symbols; falling back to equal-weight market index.")
-        market_series=close_aligned[btc_key] if btc_key else pd.DataFrame(close_aligned).mean(axis=1)
+        market_series=closes[btc_key] if btc_key else pd.DataFrame(closes).mean(axis=1)
     else:
-        market_series=pd.DataFrame(close_aligned).mean(axis=1)
-
-    if len(all_index) <= cfg.form_period:
-        print("Insufficient data for formation period.")
-        return pd.DataFrame()
+        market_series=pd.DataFrame(closes).mean(axis=1)
 
     all_trade_records: List[Dict] = []
     pos_state: Optional[Dict] = None
@@ -518,7 +507,7 @@ def backtest_single_position_flow(data: Dict[str, pd.DataFrame], cfg: Config) ->
         if start < 0:
             return []
         form_index = all_index[start:upto_bar]
-        form_prices = {s: close_aligned[s].loc[form_index] for s in symbols}
+        form_prices = {s: closes[s].loc[form_index] for s in symbols}
         form_prices = {k:v.dropna() for k,v in form_prices.items() if v.dropna().shape[0] >= max(cfg.min_form_bars, cfg.bb_window)}
         if len(form_prices) < 2:
             return []
@@ -542,7 +531,7 @@ def backtest_single_position_flow(data: Dict[str, pd.DataFrame], cfg: Config) ->
 
         if pos_state is None and (not in_cooldown):
             for (a,b,beta) in cached_pairs:
-                A = close_aligned[a]; B = close_aligned[b]
+                A = closes[a]; B = closes[b]
                 label = f"{a}-{b}"
                 state = try_open_position(A, B, beta, cfg, i, label)
                 if state is not None:
@@ -556,7 +545,7 @@ def backtest_single_position_flow(data: Dict[str, pd.DataFrame], cfg: Config) ->
         if pos_state is not None:
             a, b = pos_state["pair_label"].split("-")
             beta = float(pos_state["beta"])
-            A = close_aligned[a]; B = close_aligned[b]
+            A = closes[a]; B = closes[b]
             closed_records, new_state, consumed = step_manage_position(
                 A, B, beta, cfg, pos_state, start_bar=i, end_bar=i,
                 method_name=method,
@@ -647,7 +636,7 @@ def backtest_single_position_flow(data: Dict[str, pd.DataFrame], cfg: Config) ->
 # 运行入口
 # =========================
 if __name__ == "__main__":
-    data_dir="/home/houyi/crypto/download_data/robot/data/bybit/futures/"
+    data_dir="/home/houyi/crypto/pair_trading/data/"
     print(f"Loading data from: {data_dir}")
     data=load_freqtrade_dir(data_dir, max_symbols=33)
     cfg=Config(
